@@ -1,0 +1,362 @@
+---
+title: "NYC_Predictions"
+author: "Gosuddin Siddiqi"
+date: "February 19, 2017"
+output: pdf_document
+---
+
+```{r setup, warning=FALSE,message=FALSE}
+library(dplyr)
+library(geosphere)
+library(lubridate)
+library(rpart)
+library(randomForest)
+
+#load data
+nyc_sept_data <- read.csv("green_tripdata_2015-09.csv")
+
+
+```
+
+
+#Analysing Data
+
+```{r}
+#retreive column names
+colnames(nyc_sept_data)
+
+#summary
+summary(nyc_sept_data)
+
+#remove Ehail
+nyc_sept_data$Ehail_fee <- NULL
+
+#remove nas
+dataset <- na.omit(nyc_sept_data)
+
+```
+
+#Cleaning Data
+
+```{r}
+#remove negative values # Impossible to exists like negative distance, fares
+dataset$Fare_amount <-
+ifelse(dataset$Fare_amount<0,-(dataset$Fare_amount),dataset$Fare_amount)
+
+dataset$Extra <- ifelse(dataset$Extra<0,-(dataset$Extra),dataset$Extra)
+
+dataset$MTA_tax <- ifelse(dataset$MTA_tax<0,-(dataset$MTA_tax),dataset$MTA_tax)
+
+dataset$Tip_amount <- ifelse(dataset$Tip_amount<0,-(dataset$Tip_amount),dataset$Tip_amount)
+
+dataset$Tolls_amount <- ifelse(dataset$Tolls_amount<0,-(dataset$Tolls_amount),dataset$Tolls_amount)
+
+dataset$improvement_surcharge <- ifelse(dataset$improvement_surcharge<0,-(dataset$improvement_surcharge),dataset$improvement_surcharge)
+
+dataset$Total_amount <- ifelse(dataset$Total_amount<0,-(dataset$Total_amount),dataset$Total_amount)
+
+#summary(dataset)
+
+hist(dataset$Passenger_count)
+
+hist(dataset$Fare_amount,breaks = 10)
+hist(log(dataset$Fare_amount))
+
+boxplot(log(dataset$Fare_amount), outline = F)
+
+
+#count records with no GPS coordinates (0,0)
+n<-dataset%>%
+  filter(Pickup_longitude == 0 | Pickup_latitude == 0 |
+           Dropoff_longitude == 0 | Dropoff_latitude == 0)%>%
+  summarise(count_0 = n())
+
+#remove the records where there is no change in coordinates and trip_distance is 0
+z_dist_index <- which(dataset$Trip_distance ==0)
+
+for( i in 1:length(z_dist_index)){
+  ind <- z_dist_index[i]
+   x1 <- dataset$Pickup_latitude[ind]
+   y1 <- dataset$Pickup_longitude[ind]
+   x2 <- dataset$Dropoff_latitude[ind]
+   y2 <- dataset$Dropoff_longitude[ind]
+  dataset$Trip_distance[ind] <- distHaversine(c(y1,x1),c(y2,x2)) / 1609.34
+}
+
+#find indexes
+rem <- (which(dataset$Trip_distance ==0))
+
+#remove 
+dataset <- dataset[-rem,]
+
+#remove records with no GPS coordinates (0,0)
+rem <- which((dataset$Pickup_longitude == 0 | dataset$Pickup_latitude == 0 |
+                  dataset$Dropoff_longitude == 0 | dataset$Dropoff_latitude == 0))
+
+dataset <- dataset[-rem,]
+
+#remove rows for which amount does not exists
+rem<-which(dataset$Tip_amount == 0 & dataset$Total_amount == 0)
+
+dataset <- dataset[-rem,]
+
+#Convert date from factors to POSIX
+dataset$day_of_month_p <- mday( dataset$lpep_pickup_datetime)
+dataset$day_of_week_p <- wday( dataset$lpep_pickup_datetime)
+dataset$day_of_month_d <- mday( dataset$Lpep_dropoff_datetime)
+dataset$day_of_week_d <- wday( dataset$Lpep_dropoff_datetime)
+
+dataset$hour_p <- hour(dataset$lpep_pickup_datetime)
+dataset$hour_d <- hour(dataset$Lpep_dropoff_datetime)
+
+#create a feature tip as percentage
+
+dataset<-dataset %>%
+  mutate(tip_percentage = ((Tip_amount/Total_amount)*100))
+
+
+#Whether the driver recieved tip?
+dataset <- dataset %>%
+  mutate(gave_tip = ifelse(tip_percentage == 0,1,0))
+
+dataset <-dataset %>%
+            mutate(time_elapsed_mins = difftime(Lpep_dropoff_datetime,lpep_pickup_datetime, units ="mins"))
+
+#Launch the speed variable
+dataset$time_elapsed_mins <- as.numeric(dataset$time_elapsed_mins)
+
+
+```
+
+```{r}
+
+
+with_zero_time <-which(dataset$time_elapsed_mins == 0)
+
+summary(dataset[with_zero_time,])
+
+
+
+```
+Seems like Verifone isn't good at reporting the data. All of the data which shows 0 mins for the ride were recorded by the Verifone.
+
+```{r}
+#Removing the data that was inserted possibly randomly
+
+dataset <- dataset[-which((dataset$time_elapsed_mins == 0) & hour(dataset$lpep_pickup_datetime)==0 & hour(dataset$Lpep_dropoff_datetime) == 0),]
+
+dataset <- dataset[-which(dataset$time_elapsed_mins ==0),]
+
+```
+
+
+```{r}
+#Would NYC taxis really operate beyond 50 miles?
+summary(dataset[which(dataset$Trip_distance>50),])
+
+#seems like there are few which actually goes beyond 50 miles. Maybe we should just discard it.
+
+dataset <- dataset[-which(dataset$Trip_distance>50),]
+
+dataset <- dataset %>%
+  mutate(avg_speed = Trip_distance/(time_elapsed_mins/60))
+
+
+summary(dataset)
+```
+
+Since we know that there is no information about the cash tips, it is very unlikely that the passengers who paid the total fare in cash would have paid the tip amount in different mode of payment. So my model would be based on the assumption that if I am to predict an entry for which I know the mode of payment was cash, I would neglect it.
+```{r}
+which(dataset$Payment_type ==2 & dataset$Tip_amount != 0)
+
+#let's check rows with cash payment yet tip amount above 0
+dataset[-which(dataset$Payment_type ==2 & dataset$Tip_amount != 0),]
+
+#removing them
+dataset <- dataset[-which(dataset$Payment_type ==2 & dataset$Tip_amount != 0),]
+```
+It seems like there are only just 2 cases where we have mode of payment as cash and still some tip was awarded to the driver.
+
+
+Removing the entries for which we cannot predict the tip amount as the payment type is cash (payment type == 2)
+```{r}
+dataset <- dataset[-which(dataset$Payment_type ==2),]
+
+
+#tips only from credit card
+dataset <- dataset[which(dataset$Payment_type ==1),]
+
+```
+
+
+
+```{r}
+summary(dataset[which(dataset$avg_speed>80),])
+
+
+dataset <- dataset[-which(dataset$avg_speed>80),]
+
+dataset <-dataset[-which(dataset$tip_percentage == 100),]
+
+summary(dataset$Payment_type)
+```
+
+```{r}
+names(dataset)
+
+unique(dataset$Payment_type)
+
+
+dataset$lpep_pickup_datetime <- as.POSIXct(dataset$lpep_pickup_datetime)
+dataset$Lpep_dropoff_datetime <- as.POSIXct(dataset$Lpep_dropoff_datetime)
+dataset$RateCodeID<-as.factor(dataset$RateCodeID)
+dataset$Trip_type <- as.factor(dataset$Trip_type)
+dataset$Payment_type <- as.factor(dataset$Payment_type)
+dataset$day_of_week_d <- as.factor(dataset$day_of_week_d)
+dataset$day_of_week_p <- as.factor(dataset$day_of_week_p)
+dataset$hour_p <- as.factor(dataset$hour_p)
+dataset$hour_d <- as.factor(dataset$hour_d)
+```
+```{r}
+indep <- c("RateCodeID","Pickup_longitude","Pickup_latitude","Dropoff_longitude","Dropoff_latitude","Passenger_count","Trip_distance","Fare_amount","Extra","MTA_tax","Tolls_amount","improvement_surcharge","Payment_type","Trip_type","day_of_month_p","day_of_week_p",
+           "hour_p","time_elapsed_mins")
+
+dep <- c("gave_tip")
+
+sample <- sample(1:nrow(dataset), 0.85*nrow(dataset)) 
+
+train <-(dataset[sample,])
+test <-(dataset[-sample,])
+
+str(dataset)
+
+dc_fit <- rpart (gave_tip ~
+                Dropoff_latitude+
+                Dropoff_longitude+
+                Pickup_latitude+
+                Pickup_longitude+
+                avg_speed+
+                time_elapsed_mins+
+                Trip_distance+
+                Lpep_dropoff_datetime+
+                lpep_pickup_datetime+
+                hour_d+
+                hour_p
+                
+              ,data=train, method = "class" )
+
+
+summary(dc_fit)
+
+
+predicted= predict(dc_fit,test, type = "class")
+
+length(which(test$gave_tip == predicted))
+```
+
+```{r}
+mod <- lm(tip_percentage ~ Dropoff_latitude+
+                Dropoff_longitude+
+                Pickup_latitude+
+                Pickup_longitude+
+                avg_speed+
+                time_elapsed_mins+
+                Trip_distance+
+                Lpep_dropoff_datetime+
+                lpep_pickup_datetime+
+                hour_d+
+                hour_p, data = train )
+
+summary(mod)
+
+plot(mod$fitted.values)
+```
+
+```{r}
+#random forest attempt
+
+fit <- randomForest(gave_tip ~.
+              ,data=train[which(train$RateCodeID != 5),!names(train) %in% c("tip_percentage","Tip_amount","Total_amount")], ntree =100)
+
+summary(fit)
+
+predicted <- predict(fit,test)
+
+length(which(test$gave_tip == predicted))
+
+#sqrt(mean((test$tip_percentage - predicted)^2))
+
+rr<-roc(fit$predicted,train$gave_tip )
+plot(rr)
+
+#mod <- lm(tip_percentage ~ Trip_distance + time_elapsed_mins + Fare_amount, data = train)
+
+#summary(mod)
+
+#predicted <-predict(mod,test)
+
+#sqrt(mean((test$tip_percentage - predicted)^2))
+```
+
+
+
+#Extracting important features
+```{r}
+#remove categorical index
+cat_index<- c("lpep_pickup_datetime","Lpep_dropoff_datetime","Store_and_fwd_flag","VendorID", "RateCodeID","gave_tip","Payment_type","Trip_type")
+
+#compute PCA
+pca_res <- prcomp(dataset[-which(dataset$time_elapsed_mins==0),!names(dataset) %in% cat_index])
+
+
+```
+
+```{r}
+
+dataset <- dataset[-which(dataset$Payment_type ==2 | dataset$time_elapsed_mins>240),]
+
+
+
+mod <- glm(as.factor(gave_tip)~ Dropoff_latitude+
+                Dropoff_longitude+
+                Pickup_latitude+
+                Pickup_longitude+
+                avg_speed+
+                time_elapsed_mins+
+                Trip_distance+
+                Lpep_dropoff_datetime+
+                hour_p +
+                day_of_week_p
+              ,family = "binomial", data=train[,!colnames(train)%in%c("tip_percentage","Tip_amount",
+                                                "Total_amount")])
+
+summary(mod)
+
+fits <- fitted(mod)
+
+y <- factor(train$gave_tip)
+
+
+library(AUC)
+rr <- roc(fits,y)
+
+plot(rr)
+
+auc(rr)
+
+sample_index <- sample(1:nrow())
+test <- 
+
+res<-predict(mod,test[,!colnames(test)%in%"gave_tip"],type='response')
+
+plot(log(dataset$tip_percentage))
+
+hist(dataset$time_elapsed_mins)
+
+hist(log(dataset$tip_percentage),breaks = 20)
+
+plot(dataset$Tolls_amount, dataset$gave_tip)
+
+summary(dataset[-which(dataset$Payment_type == 2),])
+```
+
